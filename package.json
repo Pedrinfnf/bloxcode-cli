@@ -1,0 +1,22 @@
+{
+  "name": "bloxcode-cli",
+  "version": "0.1.0",
+  "description": "AI coding agent for the terminal. Built for Termux.",
+  "type": "module",
+  "bin": {
+    "bloxcode": "./bin/bloxcode.js"
+  },
+  "files": ["bin/", "src/", "README.md"],
+  "scripts": {
+    "start": "node --import tsx src/cli.ts",
+    "dev": "npx tsx src/cli.ts"
+  },
+  "dependencies": {
+    "tsx": "^4.0.0"
+  },
+  "keywords": ["ai", "agent", "terminal", "coding", "cli", "termux", "llm"],
+  "author": "Pedrinfnf",
+  "license": "MIT",
+  "repository": "https://github.com/Pedrinfnf/bloxcode-cli",
+  "engines": { "node": ">=18" }
+}

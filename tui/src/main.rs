@@ -1,15 +1,12 @@
 // ═══════════════════════════════════════════════════════════════════════════════
-// BLOXCODE TUI — Rust ratatui terminal UI
-// Handles ALL rendering and input. Talks to TS backend via JSON over stdio.
-//
-// Architecture:
-//   [User] ←→ [Rust TUI (raw mode, panels, menus)] ←→ [TS Agent (LLM, tools)]
-//
-// The TS agent runs as a child process. Communication is JSON lines over
-// stdin/stdout. The Rust TUI owns the terminal completely.
+// BLOXCODE TUI v0.1.2 — Connected to TS backend via IPC
+// Real chat, real model selector, real tool calls
 // ═══════════════════════════════════════════════════════════════════════════════
 
-use std::io;
+use std::io::{self, BufRead, BufReader, Write};
+use std::process::{Command, Stdio, Child};
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread;
 use std::time::Duration;
 use anyhow::Result;
 use crossterm::{
@@ -19,366 +16,334 @@ use crossterm::{
 };
 use ratatui::{
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout, Rect, Margin},
-    style::{Color, Modifier, Style, Stylize},
-    text::{Line, Span, Text},
-    widgets::{Block, Borders, List, ListItem, Paragraph, Wrap, Clear, Scrollbar, ScrollbarOrientation, ScrollbarState},
+    layout::{Constraint, Direction, Layout, Rect},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Borders, List, ListItem, Paragraph, Clear, Wrap},
     Frame, Terminal,
 };
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// IPC
+// ═══════════════════════════════════════════════════════════════════════════════
+
+struct Backend {
+    child: Child,
+    tx: mpsc::Sender<String>,
+}
+
+impl Backend {
+    fn start() -> Result<(Self, mpsc::Receiver<serde_json::Value>)> {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+        let backend_dir = std::path::PathBuf::from(&home).join(".bloxcode").join("backend");
+        let ipc_script = backend_dir.join("src/ipc.ts");
+
+        // Also check relative to exe (for dev/git clone usage)
+        let exe = std::env::current_exe().unwrap_or_default();
+        let exe_dir = exe.parent().and_then(|p| p.parent()).and_then(|p| p.parent()).unwrap_or(std::path::Path::new("."));
+
+        let script = if ipc_script.exists() {
+            ipc_script
+        } else if exe_dir.join("src/ipc.ts").exists() {
+            exe_dir.join("src/ipc.ts")
+        } else {
+            // Last resort: current directory
+            std::path::PathBuf::from("src/ipc.ts")
+        };
+
+        // Find tsx
+        let tsx_paths = [
+            backend_dir.join("node_modules/.bin/tsx"),
+            exe_dir.join("node_modules/.bin/tsx"),
+            std::path::PathBuf::from("node_modules/.bin/tsx"),
+        ];
+        let tsx_bin = tsx_paths.iter().find(|p| p.exists());
+
+        let (program, mut args) = if let Some(tsx) = tsx_bin {
+            (tsx.to_str().unwrap().to_string(), vec![])
+        } else {
+            ("npx".to_string(), vec!["tsx".to_string()])
+        };
+        args.push(script.to_str().unwrap().to_string());
+
+        let mut child = Command::new(&program)
+            .args(&args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()?;
+
+        let stdout = child.stdout.take().unwrap();
+        let (msg_tx, msg_rx) = mpsc::channel();
+
+        // Read thread — receives JSON lines from TS backend
+        thread::spawn(move || {
+            let reader = BufReader::new(stdout);
+            for line in reader.lines() {
+                if let Ok(line) = line {
+                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
+                        let _ = msg_tx.send(val);
+                    }
+                }
+            }
+        });
+
+        let (cmd_tx, cmd_rx) = mpsc::channel::<String>();
+        let mut stdin = child.stdin.take().unwrap();
+
+        // Write thread — sends commands to TS backend
+        thread::spawn(move || {
+            while let Ok(cmd) = cmd_rx.recv() {
+                let _ = writeln!(stdin, "{}", cmd);
+                let _ = stdin.flush();
+            }
+        });
+
+        Ok((Backend { child, tx: cmd_tx }, msg_rx))
+    }
+
+    fn send(&self, cmd: &serde_json::Value) {
+        let _ = self.tx.send(serde_json::to_string(cmd).unwrap());
+    }
+}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // APP STATE
 // ═══════════════════════════════════════════════════════════════════════════════
 
+#[derive(Clone)]
+struct Msg { role: String, content: String }
+
+#[derive(Clone)]
+struct ModelItem { id: String, name: String, ctx: u64, free: bool }
+
+#[derive(PartialEq, Clone)]
+enum Mode { Normal, CommandPalette, ModelSelector, ApiSetup }
+
 struct App {
     input: String,
     cursor: usize,
     messages: Vec<Msg>,
-    scroll: usize,
-    mode: AppMode,
-    commands: Vec<Cmd>,
-    cmd_selected: usize,
-    cmd_filter: String,
+    mode: Mode,
     model: String,
+    provider: String,
     status: String,
+    streaming: String,      // accumulates streamed text
+    is_streaming: bool,
+    credits: Option<String>, // e.g. "46/50"
+    // Command palette
+    commands: Vec<(String, String)>,
+    cmd_selected: usize,
+    // Model selector
+    models: Vec<ModelItem>,
+    model_selected: usize,
+    model_filter: String,
+    // API setup
+    providers_list: Vec<(String, String)>, // (id, name)
+    api_step: u8, // 0=choose provider, 1=paste key, 2=test
+    api_provider_selected: usize,
+    api_key_input: String,
     should_quit: bool,
-}
-
-struct Msg {
-    role: String,
-    content: String,
-}
-
-struct Cmd {
-    name: String,
-    desc: String,
-}
-
-#[derive(PartialEq)]
-enum AppMode {
-    Normal,
-    CommandPalette, // / was pressed — show command list
 }
 
 impl App {
     fn new() -> Self {
-        let commands = vec![
-            Cmd { name: "/help".into(), desc: "Show commands".into() },
-            Cmd { name: "/model".into(), desc: "Switch model".into() },
-            Cmd { name: "/api set".into(), desc: "Set API key".into() },
-            Cmd { name: "/api show".into(), desc: "Show API key".into() },
-            Cmd { name: "/mode".into(), desc: "Change mode".into() },
-            Cmd { name: "/agent".into(), desc: "Multi-agent".into() },
-            Cmd { name: "/tools".into(), desc: "List tools".into() },
-            Cmd { name: "/mcp".into(), desc: "MCP status".into() },
-            Cmd { name: "/mcp add".into(), desc: "Add MCP server".into() },
-            Cmd { name: "/clear".into(), desc: "Clear context".into() },
-            Cmd { name: "/exit".into(), desc: "Quit".into() },
-        ];
-
         Self {
-            input: String::new(),
-            cursor: 0,
-            messages: vec![Msg {
-                role: "system".into(),
-                content: "Welcome to BloxCode. Type /help or start chatting.".into(),
-            }],
-            scroll: 0,
-            mode: AppMode::Normal,
-            commands,
+            input: String::new(), cursor: 0,
+            messages: vec![Msg { role: "system".into(), content: "Starting backend...".into() }],
+            mode: Mode::Normal, model: "loading...".into(), provider: "openrouter".into(),
+            status: "connecting".into(), streaming: String::new(), is_streaming: false,
+            credits: None,
+            commands: vec![
+                ("/help".into(), "Show commands".into()),
+                ("/model".into(), "Switch model".into()),
+                ("/api".into(), "Setup API provider + key".into()),
+                ("/agent".into(), "Multi-agent orchestrator".into()),
+                ("/tools".into(), "List all tools".into()),
+                ("/mcp".into(), "MCP status".into()),
+                ("/clear".into(), "Clear context".into()),
+                ("/reasoning".into(), "Toggle reasoning".into()),
+                ("/exit".into(), "Quit".into()),
+            ],
             cmd_selected: 0,
-            cmd_filter: String::new(),
-            model: "nemotron-ultra-550b".into(),
-            status: "ready".into(),
+            models: vec![], model_selected: 0, model_filter: String::new(),
+            providers_list: vec![
+                ("openrouter".into(), "OpenRouter (multi-model, free tier)".into()),
+                ("openai".into(), "OpenAI (GPT-5, o3)".into()),
+                ("anthropic".into(), "Anthropic (Claude)".into()),
+                ("google".into(), "Google Gemini".into()),
+                ("groq".into(), "Groq (fast, free)".into()),
+                ("deepseek".into(), "DeepSeek".into()),
+                ("xai".into(), "xAI (Grok)".into()),
+                ("mistral".into(), "Mistral AI".into()),
+                ("together".into(), "Together AI".into()),
+                ("cerebras".into(), "Cerebras (fast, free)".into()),
+                ("cohere".into(), "Cohere".into()),
+                ("ollama".into(), "Ollama (local)".into()),
+                ("lmstudio".into(), "LM Studio (local)".into()),
+                ("custom".into(), "Custom OpenAI-compatible".into()),
+            ],
+            api_step: 0, api_provider_selected: 0, api_key_input: String::new(),
             should_quit: false,
         }
     }
 
-    fn filtered_commands(&self) -> Vec<&Cmd> {
-        if self.cmd_filter.is_empty() {
-            self.commands.iter().collect()
-        } else {
-            let f = self.cmd_filter.to_lowercase();
-            self.commands.iter().filter(|c| c.name.to_lowercase().contains(&f) || c.desc.to_lowercase().contains(&f)).collect()
-        }
+    fn filtered_commands(&self) -> Vec<(usize, &(String, String))> {
+        let filter = if self.input.len() > 1 { self.input[1..].to_lowercase() } else { String::new() };
+        self.commands.iter().enumerate()
+            .filter(|(_, c)| filter.is_empty() || c.0.to_lowercase().contains(&filter) || c.1.to_lowercase().contains(&filter))
+            .collect()
     }
 
-    fn submit_input(&mut self) {
-        let input = self.input.trim().to_string();
-        if input.is_empty() { return; }
-
-        self.messages.push(Msg { role: "user".into(), content: input.clone() });
-        self.input.clear();
-        self.cursor = 0;
-        self.mode = AppMode::Normal;
-
-        if input == "/exit" || input == "/quit" {
-            self.should_quit = true;
-            return;
-        }
-
-        if input == "/help" {
-            let help = self.commands.iter().map(|c| format!("  {} — {}", c.name, c.desc)).collect::<Vec<_>>().join("\n");
-            self.messages.push(Msg { role: "system".into(), content: help });
-            return;
-        }
-
-        if input == "/clear" {
-            self.messages.clear();
-            self.messages.push(Msg { role: "system".into(), content: "Cleared.".into() });
-            return;
-        }
-
-        // TODO: send to TS backend via IPC
-        self.messages.push(Msg {
-            role: "assistant".into(),
-            content: format!("[TUI mode — TS backend integration coming]\nYou said: {}", input),
-        });
-        self.scroll_to_bottom();
+    fn filtered_models(&self) -> Vec<&ModelItem> {
+        if self.model_filter.is_empty() { self.models.iter().collect() }
+        else { let f = self.model_filter.to_lowercase(); self.models.iter().filter(|m| m.id.to_lowercase().contains(&f) || m.name.to_lowercase().contains(&f)).collect() }
     }
 
-    fn scroll_to_bottom(&mut self) {
-        let total_lines: usize = self.messages.iter().map(|m| m.content.lines().count() + 1).sum();
-        self.scroll = total_lines.saturating_sub(10);
+    fn add_msg(&mut self, role: &str, content: &str) {
+        self.messages.push(Msg { role: role.into(), content: content.into() });
     }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// UI RENDERING
+// UI
 // ═══════════════════════════════════════════════════════════════════════════════
 
 fn ui(f: &mut Frame, app: &App) {
-    let area = f.area();
+    let chunks = Layout::default().direction(Direction::Vertical).constraints([
+        Constraint::Length(1), Constraint::Min(1), Constraint::Length(3), Constraint::Length(1),
+    ]).split(f.area());
 
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(2),     // header
-            Constraint::Min(1),        // chat
-            Constraint::Length(3),     // input
-            Constraint::Length(1),     // status
-        ])
-        .split(area);
-
-    render_header(f, chunks[0], app);
-    render_chat(f, chunks[1], app);
-    render_input(f, chunks[2], app);
-    render_status(f, chunks[3], app);
-
-    // Command palette overlay
-    if app.mode == AppMode::CommandPalette {
-        render_command_palette(f, area, app);
-    }
-}
-
-fn render_header(f: &mut Frame, area: Rect, app: &App) {
+    // Header
+    let cred = app.credits.as_deref().unwrap_or("");
     let header = Line::from(vec![
-        Span::styled(" ● ", Style::default().fg(Color::Cyan).bold()),
-        Span::styled("bloxcode", Style::default().fg(Color::Cyan).bold()),
+        Span::styled(" ● ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::styled("bloxcode", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
         Span::styled(" · ", Style::default().fg(Color::DarkGray)),
         Span::styled(&app.model, Style::default().fg(Color::Yellow)),
+        Span::styled(" · ", Style::default().fg(Color::DarkGray)),
+        Span::styled(&app.provider, Style::default().fg(Color::Green)),
+        Span::styled(if cred.is_empty() { String::new() } else { format!(" · {}", cred) }, Style::default().fg(Color::Magenta)),
     ]);
-    f.render_widget(Paragraph::new(header), area);
-}
+    f.render_widget(Paragraph::new(header), chunks[0]);
 
-fn render_chat(f: &mut Frame, area: Rect, app: &App) {
+    // Chat
     let mut items: Vec<ListItem> = Vec::new();
-
     for msg in &app.messages {
         let (prefix, style) = match msg.role.as_str() {
-            "user" => ("you ", Style::default().fg(Color::White)),
-            "assistant" => ("ai  ", Style::default().fg(Color::Cyan)),
-            "system" => ("sys ", Style::default().fg(Color::DarkGray)),
-            _ => ("??? ", Style::default()),
+            "user" => (" you ", Style::default().fg(Color::White)),
+            "assistant" | "ai" => ("  ai ", Style::default().fg(Color::Cyan)),
+            "tool" => ("tool ", Style::default().fg(Color::Yellow)),
+            _ => (" sys ", Style::default().fg(Color::DarkGray)),
         };
-
         for (i, line) in msg.content.lines().enumerate() {
-            let p = if i == 0 { prefix } else { "    " };
+            let p = if i == 0 { prefix } else { "     " };
             items.push(ListItem::new(Line::from(vec![
                 Span::styled(p, style.add_modifier(Modifier::BOLD)),
                 Span::styled(line, style),
             ])));
         }
-        items.push(ListItem::new(Line::from(""))); // gap
     }
+    // Streaming text
+    if app.is_streaming && !app.streaming.is_empty() {
+        for (i, line) in app.streaming.lines().enumerate() {
+            let p = if i == 0 { "  ai " } else { "     " };
+            items.push(ListItem::new(Line::from(vec![
+                Span::styled(p, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Span::styled(line, Style::default().fg(Color::Cyan)),
+            ])));
+        }
+        items.push(ListItem::new(Line::from(Span::styled("  ▊", Style::default().fg(Color::Cyan)))));
+    }
+    f.render_widget(List::new(items), chunks[1]);
 
-    let list = List::new(items)
-        .block(Block::default().borders(Borders::NONE));
-    f.render_widget(list, area);
-}
-
-fn render_input(f: &mut Frame, area: Rect, app: &App) {
-    let input_text = Line::from(vec![
-        Span::styled(" > ", Style::default().fg(Color::Green).bold()),
-        Span::raw(&app.input),
-        Span::styled("█", Style::default().fg(Color::Cyan)),
+    // Input
+    let input_line = Line::from(vec![
+        Span::styled(" > ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+        Span::raw(&app.input), Span::styled("█", Style::default().fg(Color::Cyan)),
     ]);
-    let input = Paragraph::new(input_text)
-        .block(Block::default()
-            .borders(Borders::TOP)
-            .border_style(Style::default().fg(Color::DarkGray)));
-    f.render_widget(input, area);
-}
+    f.render_widget(
+        Paragraph::new(input_line).block(Block::default().borders(Borders::TOP).border_style(Style::default().fg(Color::DarkGray))),
+        chunks[2]
+    );
 
-fn render_status(f: &mut Frame, area: Rect, app: &App) {
-    let bar = Line::from(vec![
-        Span::styled(" /", Style::default().fg(Color::DarkGray)),
-        Span::styled("commands", Style::default().fg(Color::DarkGray)),
-        Span::styled(" · ", Style::default().fg(Color::DarkGray)),
-        Span::styled("@", Style::default().fg(Color::DarkGray)),
-        Span::styled("file", Style::default().fg(Color::DarkGray)),
-        Span::styled(" · ", Style::default().fg(Color::DarkGray)),
-        Span::styled("!", Style::default().fg(Color::DarkGray)),
-        Span::styled("shell", Style::default().fg(Color::DarkGray)),
-        Span::styled("        ", Style::default()),
-        Span::styled(&app.status, Style::default().fg(Color::DarkGray)),
+    // Status
+    let status = Line::from(vec![
+        Span::styled(format!(" {} ", app.status), Style::default().fg(Color::DarkGray)),
+        Span::styled("  /cmd · @file · !shell · ctrl+c quit", Style::default().fg(Color::DarkGray)),
     ]);
-    f.render_widget(Paragraph::new(bar), area);
+    f.render_widget(Paragraph::new(status), chunks[3]);
+
+    // Overlays
+    match &app.mode {
+        Mode::CommandPalette => render_cmd_palette(f, f.area(), app),
+        Mode::ModelSelector => render_model_selector(f, f.area(), app),
+        Mode::ApiSetup => render_api_setup(f, f.area(), app),
+        _ => {}
+    }
 }
 
-fn render_command_palette(f: &mut Frame, area: Rect, app: &App) {
+fn render_cmd_palette(f: &mut Frame, area: Rect, app: &App) {
     let filtered = app.filtered_commands();
-    let height = (filtered.len() + 4).min(15) as u16;
-    let width = 40.min(area.width.saturating_sub(4));
-
-    // Position above the input area
-    let x = 2;
-    let y = area.height.saturating_sub(height + 4);
-    let popup = Rect::new(x, y, width, height);
-
+    let h = (filtered.len() + 3).min(14) as u16;
+    let w = 44.min(area.width - 2);
+    let popup = Rect::new(1, area.height.saturating_sub(h + 4), w, h);
     f.render_widget(Clear, popup);
-
-    let items: Vec<ListItem> = filtered.iter().enumerate().map(|(i, cmd)| {
-        let style = if i == app.cmd_selected {
-            Style::default().fg(Color::White).bg(Color::DarkGray).bold()
-        } else {
-            Style::default().fg(Color::White)
-        };
-        let pointer = if i == app.cmd_selected { "▸ " } else { "  " };
+    let items: Vec<ListItem> = filtered.iter().map(|(_, cmd)| {
+        let sel = app.commands.iter().position(|c| c.0 == cmd.0).unwrap_or(99) == app.cmd_selected;
+        let s = if sel { Style::default().fg(Color::White).bg(Color::DarkGray).add_modifier(Modifier::BOLD) } else { Style::default() };
         ListItem::new(Line::from(vec![
-            Span::styled(pointer, Style::default().fg(Color::Cyan)),
-            Span::styled(&cmd.name, style),
-            Span::styled(format!("  {}", cmd.desc), Style::default().fg(Color::DarkGray)),
+            Span::styled(if sel { "▸ " } else { "  " }, Style::default().fg(Color::Cyan)),
+            Span::styled(&cmd.0, s), Span::styled(format!("  {}", cmd.1), Style::default().fg(Color::DarkGray)),
         ]))
     }).collect();
-
-    let list = List::new(items)
-        .block(Block::default()
-            .title(" commands ")
-            .title_style(Style::default().fg(Color::Cyan).bold())
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan)));
-    f.render_widget(list, popup);
+    f.render_widget(List::new(items).block(Block::default().title(" commands ").title_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)).borders(Borders::ALL).border_style(Style::default().fg(Color::Cyan))), popup);
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// EVENT HANDLING
-// ═══════════════════════════════════════════════════════════════════════════════
-
-fn handle_event(app: &mut App) -> Result<bool> {
-    if !event::poll(Duration::from_millis(50))? {
-        return Ok(false);
-    }
-
-    if let Event::Key(key) = event::read()? {
-        if key.kind != KeyEventKind::Press { return Ok(false); }
-
-        // Ctrl+C always quits
-        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-            app.should_quit = true;
-            return Ok(true);
-        }
-
-        match app.mode {
-            AppMode::Normal => handle_normal(app, key.code),
-            AppMode::CommandPalette => handle_command_palette(app, key.code),
-        }
-    }
-    Ok(false)
+fn render_model_selector(f: &mut Frame, area: Rect, app: &App) {
+    let filtered = app.filtered_models();
+    let h = (filtered.len() + 4).min(20) as u16;
+    let w = (area.width - 4).min(60);
+    let popup = Rect::new(2, 2, w, h);
+    f.render_widget(Clear, popup);
+    let items: Vec<ListItem> = filtered.iter().enumerate().map(|(i, m)| {
+        let sel = i == app.model_selected;
+        let s = if sel { Style::default().fg(Color::White).bg(Color::DarkGray).add_modifier(Modifier::BOLD) } else { Style::default() };
+        let tag = if m.free { Span::styled(" [FREE]", Style::default().fg(Color::Green)) } else { Span::raw("") };
+        ListItem::new(Line::from(vec![
+            Span::styled(if sel { "▸ " } else { "  " }, Style::default().fg(Color::Cyan)),
+            Span::styled(&m.name, s), Span::styled(format!("  ctx:{}k", m.ctx / 1000), Style::default().fg(Color::DarkGray)), tag,
+        ]))
+    }).collect();
+    let title = if app.model_filter.is_empty() { " models ".to_string() } else { format!(" models — \"{}\" ", app.model_filter) };
+    f.render_widget(List::new(items).block(Block::default().title(title).title_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)).borders(Borders::ALL).border_style(Style::default().fg(Color::Cyan))), popup);
 }
 
-fn handle_normal(app: &mut App, key: KeyCode) {
-    match key {
-        KeyCode::Char(c) => {
-            app.input.insert(app.cursor, c);
-            app.cursor += 1;
-            // Auto-open command palette when typing /
-            if app.input == "/" {
-                app.mode = AppMode::CommandPalette;
-                app.cmd_selected = 0;
-                app.cmd_filter.clear();
-            }
-        }
-        KeyCode::Backspace => {
-            if app.cursor > 0 {
-                app.cursor -= 1;
-                app.input.remove(app.cursor);
-            }
-        }
-        KeyCode::Enter => app.submit_input(),
-        KeyCode::Left => { if app.cursor > 0 { app.cursor -= 1; } }
-        KeyCode::Right => { if app.cursor < app.input.len() { app.cursor += 1; } }
-        KeyCode::Up => { app.scroll = app.scroll.saturating_sub(1); }
-        KeyCode::Down => { app.scroll += 1; }
-        KeyCode::Esc => { app.input.clear(); app.cursor = 0; }
-        _ => {}
-    }
-}
+fn render_api_setup(f: &mut Frame, area: Rect, app: &App) {
+    let w = (area.width - 4).min(50);
+    let h = if app.api_step == 0 { (app.providers_list.len() + 3).min(18) as u16 } else { 8 };
+    let popup = Rect::new(2, 2, w, h);
+    f.render_widget(Clear, popup);
 
-fn handle_command_palette(app: &mut App, key: KeyCode) {
-    let filtered_len = app.filtered_commands().len();
-    match key {
-        KeyCode::Up => {
-            app.cmd_selected = app.cmd_selected.saturating_sub(1);
-        }
-        KeyCode::Down => {
-            if app.cmd_selected + 1 < filtered_len {
-                app.cmd_selected += 1;
-            }
-        }
-        KeyCode::Enter => {
-            let selected_name = {
-                let filtered = app.filtered_commands();
-                filtered.get(app.cmd_selected).map(|c| c.name.clone())
-            };
-            if let Some(name) = selected_name {
-                let auto_submit = name == "/exit" || name == "/help" || name == "/clear" || name == "/tools" || name == "/mcp";
-                app.input = name;
-                if auto_submit {
-                    app.cursor = app.input.len();
-                    app.mode = AppMode::Normal;
-                    app.submit_input();
-                } else {
-                    app.input.push(' ');
-                    app.cursor = app.input.len();
-                    app.mode = AppMode::Normal;
-                }
-            }
-        }
-        KeyCode::Esc => {
-            app.mode = AppMode::Normal;
-            app.input.clear();
-            app.cursor = 0;
-        }
-        KeyCode::Backspace => {
-            if app.input.len() <= 1 {
-                app.mode = AppMode::Normal;
-                app.input.clear();
-                app.cursor = 0;
-            } else {
-                app.cursor = app.cursor.saturating_sub(1);
-                if app.cursor < app.input.len() { app.input.remove(app.cursor); }
-                app.cmd_filter = app.input[1..].to_string();
-                app.cmd_selected = 0;
-            }
-        }
-        KeyCode::Char(c) => {
-            app.input.insert(app.cursor, c);
-            app.cursor += 1;
-            app.cmd_filter = app.input[1..].to_string();
-            app.cmd_selected = 0;
-        }
-        _ => {}
+    if app.api_step == 0 {
+        let items: Vec<ListItem> = app.providers_list.iter().enumerate().map(|(i, (id, name))| {
+            let sel = i == app.api_provider_selected;
+            let s = if sel { Style::default().fg(Color::White).bg(Color::DarkGray).add_modifier(Modifier::BOLD) } else { Style::default() };
+            ListItem::new(Line::from(vec![
+                Span::styled(if sel { "▸ " } else { "  " }, Style::default().fg(Color::Cyan)),
+                Span::styled(id, s), Span::styled(format!("  {}", name), Style::default().fg(Color::DarkGray)),
+            ]))
+        }).collect();
+        f.render_widget(List::new(items).block(Block::default().title(" choose provider ").title_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)).borders(Borders::ALL).border_style(Style::default().fg(Color::Cyan))), popup);
+    } else {
+        let lines = vec![
+            Line::from(Span::styled("  paste your API key:", Style::default().fg(Color::White))),
+            Line::from(""),
+            Line::from(vec![Span::styled("  > ", Style::default().fg(Color::Green)), Span::raw(&app.api_key_input), Span::styled("█", Style::default().fg(Color::Cyan))]),
+            Line::from(""),
+            Line::from(Span::styled("  Enter to save · Esc to cancel", Style::default().fg(Color::DarkGray))),
+        ];
+        f.render_widget(Paragraph::new(lines).block(Block::default().title(format!(" {} API key ", app.providers_list.get(app.api_provider_selected).map(|p| p.0.as_str()).unwrap_or("?"))).title_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)).borders(Borders::ALL).border_style(Style::default().fg(Color::Cyan))), popup);
     }
 }
 
@@ -386,29 +351,230 @@ fn handle_command_palette(app: &mut App, key: KeyCode) {
 // MAIN
 // ═══════════════════════════════════════════════════════════════════════════════
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    // Setup terminal
+fn main() -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
+    let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
 
     let mut app = App::new();
 
-    // Main loop
+    // Start TS backend
+    let (backend, rx) = match Backend::start() {
+        Ok(b) => b,
+        Err(e) => {
+            disable_raw_mode()?;
+            execute!(io::stdout(), LeaveAlternateScreen)?;
+            eprintln!("Failed to start backend: {}", e);
+            eprintln!("Make sure tsx and node are installed");
+            return Ok(());
+        }
+    };
+
+    // Request credits on start
+    backend.send(&serde_json::json!({"cmd": "credits"}));
+
     loop {
+        // Process backend messages (non-blocking)
+        while let Ok(msg) = rx.try_recv() {
+            let t = msg.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            match t {
+                "ready" => {
+                    app.status = "ready".into();
+                    app.model = msg.get("model").and_then(|v| v.as_str()).unwrap_or("?").to_string();
+                    app.provider = msg.get("provider").and_then(|v| v.as_object()).and_then(|p| p.get("name")).and_then(|v| v.as_str()).unwrap_or("?").to_string();
+                    app.messages.clear();
+                    app.add_msg("system", &format!("Connected to {}. Type /help or start chatting.", app.provider));
+                }
+                "stream" => {
+                    app.is_streaming = true;
+                    app.status = "streaming".into();
+                    if let Some(chunk) = msg.get("chunk").and_then(|v| v.as_str()) {
+                        app.streaming.push_str(chunk);
+                    }
+                }
+                "stream_end" | "response" => {
+                    if t == "response" {
+                        if let Some(content) = msg.get("content").and_then(|v| v.as_str()) {
+                            if app.is_streaming {
+                                app.streaming.push_str(content);
+                            } else {
+                                app.add_msg("ai", content);
+                            }
+                        }
+                    }
+                }
+                "done" => {
+                    if app.is_streaming {
+                        let text = std::mem::take(&mut app.streaming);
+                        if !text.is_empty() { app.add_msg("ai", &text); }
+                    }
+                    app.is_streaming = false;
+                    app.status = "ready".into();
+                }
+                "reasoning" => {
+                    if let Some(r) = msg.get("content").and_then(|v| v.as_str()) {
+                        if !r.is_empty() { app.add_msg("system", &format!("💭 {}", &r[..r.len().min(200)])); }
+                    }
+                }
+                "tool_call" => {
+                    let tool = msg.get("tool").and_then(|v| v.as_str()).unwrap_or("?");
+                    app.add_msg("tool", &format!("→ {}", tool));
+                    app.status = format!("tool: {}", tool);
+                }
+                "tool_result" => {
+                    let tool = msg.get("tool").and_then(|v| v.as_str()).unwrap_or("?");
+                    let ok = msg.get("result").and_then(|v| v.get("ok")).and_then(|v| v.as_bool()).unwrap_or(false);
+                    app.add_msg("tool", &format!("{} {}", if ok { "✓" } else { "✗" }, tool));
+                }
+                "models" => {
+                    if let Some(models) = msg.get("models").and_then(|v| v.as_array()) {
+                        app.models = models.iter().map(|m| ModelItem {
+                            id: m.get("id").and_then(|v| v.as_str()).unwrap_or("?").to_string(),
+                            name: m.get("name").and_then(|v| v.as_str()).unwrap_or("?").to_string(),
+                            ctx: m.get("context").and_then(|v| v.as_u64()).unwrap_or(0),
+                            free: m.get("pricing").and_then(|v| v.get("input")).and_then(|v| v.as_f64()).unwrap_or(1.0) == 0.0,
+                        }).collect();
+                        app.mode = Mode::ModelSelector;
+                        app.model_selected = 0;
+                        app.model_filter.clear();
+                    }
+                }
+                "credits" => {
+                    if let Some(c) = msg.get("credits").and_then(|v| v.as_object()) {
+                        let rem = c.get("remaining").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                        let lim = c.get("limit").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                        if lim > 0.0 { app.credits = Some(format!("{:.0}/{:.0}", rem, lim)); }
+                    }
+                }
+                "ok" => {
+                    if let Some(m) = msg.get("msg").and_then(|v| v.as_str()) { app.add_msg("system", m); }
+                }
+                "error" => {
+                    if let Some(m) = msg.get("msg").and_then(|v| v.as_str()) { app.add_msg("system", &format!("✗ {}", m)); }
+                    app.is_streaming = false;
+                    app.status = "error".into();
+                }
+                _ => {}
+            }
+        }
+
         terminal.draw(|f| ui(f, &app))?;
-        handle_event(&mut app)?;
-        if app.should_quit { break; }
+
+        if !event::poll(Duration::from_millis(30))? { continue; }
+        if let Event::Key(key) = event::read()? {
+            if key.kind != KeyEventKind::Press { continue; }
+            if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) { app.should_quit = true; }
+
+            match app.mode.clone() {
+                Mode::Normal => match key.code {
+                    KeyCode::Char(c) => {
+                        app.input.insert(app.cursor, c); app.cursor += 1;
+                        if app.input == "/" { app.mode = Mode::CommandPalette; app.cmd_selected = 0; }
+                    }
+                    KeyCode::Backspace => { if app.cursor > 0 { app.cursor -= 1; app.input.remove(app.cursor); } }
+                    KeyCode::Enter => {
+                        let input = app.input.trim().to_string();
+                        app.input.clear(); app.cursor = 0;
+                        if input.is_empty() { continue; }
+                        if input == "/exit" || input == "/quit" { app.should_quit = true; continue; }
+                        if input == "/clear" { backend.send(&serde_json::json!({"cmd":"clear"})); app.messages.clear(); continue; }
+                        if input == "/model" { backend.send(&serde_json::json!({"cmd":"models"})); app.status = "loading models...".into(); continue; }
+                        if input == "/api" { app.mode = Mode::ApiSetup; app.api_step = 0; app.api_provider_selected = 0; continue; }
+                        if input == "/tools" { backend.send(&serde_json::json!({"cmd":"tools"})); continue; }
+                        if input.starts_with("!") { let cmd = input[1..].trim(); backend.send(&serde_json::json!({"cmd":"exec","command":cmd})); app.add_msg("user", &format!("!{}", cmd)); continue; }
+                        if input.starts_with("/agent ") { let task = input[7..].trim(); backend.send(&serde_json::json!({"cmd":"agent","task":task})); app.add_msg("user", &input); continue; }
+
+                        app.add_msg("user", &input);
+                        app.status = "thinking...".into();
+                        app.is_streaming = false;
+                        app.streaming.clear();
+                        backend.send(&serde_json::json!({"cmd":"chat","content":input,"reasoning":"high"}));
+                    }
+                    KeyCode::Esc => { app.input.clear(); app.cursor = 0; }
+                    _ => {}
+                },
+                Mode::CommandPalette => match key.code {
+                    KeyCode::Up => { app.cmd_selected = app.cmd_selected.saturating_sub(1); }
+                    KeyCode::Down => { if app.cmd_selected + 1 < app.filtered_commands().len() { app.cmd_selected += 1; } }
+                    KeyCode::Enter => {
+                        let name = app.filtered_commands().get(app.cmd_selected).map(|(_, c)| c.0.clone());
+                        if let Some(name) = name {
+                            app.input = name.clone(); app.cursor = app.input.len(); app.mode = Mode::Normal;
+                            if ["/exit","/help","/clear","/tools","/model","/api","/mcp"].contains(&name.as_str()) {
+                                // Simulate enter
+                                let input = std::mem::take(&mut app.input); app.cursor = 0;
+                                if input == "/exit" { app.should_quit = true; }
+                                else if input == "/model" { backend.send(&serde_json::json!({"cmd":"models"})); app.status = "loading models...".into(); }
+                                else if input == "/api" { app.mode = Mode::ApiSetup; app.api_step = 0; }
+                                else if input == "/clear" { backend.send(&serde_json::json!({"cmd":"clear"})); app.messages.clear(); }
+                                else if input == "/tools" { backend.send(&serde_json::json!({"cmd":"tools"})); }
+                                else if input == "/mcp" { backend.send(&serde_json::json!({"cmd":"mcp_status"})); }
+                            } else { app.input.push(' '); app.cursor = app.input.len(); }
+                        }
+                    }
+                    KeyCode::Esc => { app.mode = Mode::Normal; app.input.clear(); app.cursor = 0; }
+                    KeyCode::Backspace => {
+                        if app.input.len() <= 1 { app.mode = Mode::Normal; app.input.clear(); app.cursor = 0; }
+                        else { app.cursor -= 1; app.input.remove(app.cursor); }
+                    }
+                    KeyCode::Char(c) => { app.input.insert(app.cursor, c); app.cursor += 1; app.cmd_selected = 0; }
+                    _ => {}
+                },
+                Mode::ModelSelector => match key.code {
+                    KeyCode::Up => { app.model_selected = app.model_selected.saturating_sub(1); }
+                    KeyCode::Down => { let max = app.filtered_models().len(); if app.model_selected + 1 < max { app.model_selected += 1; } }
+                    KeyCode::Enter => {
+                        let id = app.filtered_models().get(app.model_selected).map(|m| m.id.clone());
+                        if let Some(id) = id {
+                            backend.send(&serde_json::json!({"cmd":"set_model","model":id}));
+                            app.model = id; app.mode = Mode::Normal;
+                        }
+                    }
+                    KeyCode::Esc => { app.mode = Mode::Normal; }
+                    KeyCode::Backspace => { app.model_filter.pop(); app.model_selected = 0; }
+                    KeyCode::Char(c) => { app.model_filter.push(c); app.model_selected = 0; }
+                    _ => {}
+                },
+                Mode::ApiSetup => {
+                    if app.api_step == 0 {
+                        match key.code {
+                            KeyCode::Up => { app.api_provider_selected = app.api_provider_selected.saturating_sub(1); }
+                            KeyCode::Down => { if app.api_provider_selected + 1 < app.providers_list.len() { app.api_provider_selected += 1; } }
+                            KeyCode::Enter => { app.api_step = 1; app.api_key_input.clear(); }
+                            KeyCode::Esc => { app.mode = Mode::Normal; }
+                            _ => {}
+                        }
+                    } else {
+                        match key.code {
+                            KeyCode::Char(c) => { app.api_key_input.push(c); }
+                            KeyCode::Backspace => { app.api_key_input.pop(); }
+                            KeyCode::Enter => {
+                                let prov_id = app.providers_list.get(app.api_provider_selected).map(|p| p.0.clone()).unwrap_or_default();
+                                let key = app.api_key_input.clone();
+                                backend.send(&serde_json::json!({"cmd":"set_provider","provider":prov_id,"key":key}));
+                                app.provider = prov_id;
+                                app.mode = Mode::Normal;
+                                app.add_msg("system", "API configured. Fetching credits...");
+                                backend.send(&serde_json::json!({"cmd":"credits"}));
+                            }
+                            KeyCode::Esc => { app.mode = Mode::Normal; }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+
+        if app.should_quit {
+            backend.send(&serde_json::json!({"cmd":"quit"}));
+            break;
+        }
     }
 
-    // Restore terminal
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
-
     println!("\n  ● goodbye\n");
     Ok(())
 }

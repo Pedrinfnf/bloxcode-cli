@@ -10,8 +10,10 @@ export async function loadConfig(): Promise<Config> {
   const def: Config = {
     apiKey: process.env.OPENROUTER_API_KEY || "",
     apiBaseUrl: "https://openrouter.ai/api/v1",
+    provider: "openrouter",
     model: "nvidia/nemotron-3-ultra-550b-a55b:free",
     mode: "suggest", profile: "safe", workspace: process.cwd(),
+    reasoning: "high",
   };
   try { await fs.mkdir(DIR, { recursive: true }); const d = JSON.parse(await fs.readFile(FILE, "utf8")); return { ...def, ...d, workspace: process.cwd() }; }
   catch { return def; }
